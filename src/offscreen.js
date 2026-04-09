@@ -9,14 +9,13 @@ let isCapturing = false;
 let apiKey = "";
 let activeTabId = null;
 let partialTranscript = "";
-const transcriptBuffer = [];
-let suggestionDebounceId = null;
+let outputSuggestionTranscript = "";
+let finalizedSuggestions = [];
 let pendingPcmSamples = [];
 const PCM_BATCH_SAMPLES = 4000; // ~250ms at 16kHz
 
 const LIVE_MODEL = "gemini-3.1-flash-live-preview";
 const LIVE_MODEL_FALLBACK = "gemini-2.5-flash-native-audio-preview-12-2025";
-const SUGGESTION_MODEL = "gemini-flash-lite-latest";
 let currentLiveModel = LIVE_MODEL;
 
 let liveSession = null;
@@ -26,6 +25,15 @@ let reconnectAttempt = 0;
 const MAX_RECONNECT_ATTEMPTS = 8;
 let isConnectingLive = false;
 let liveConnectionToken = 0;
+
+const ENTAB_KNOWLEDGE_BASE =
+  "Entab Infotech is an Indian EdTech company with 23+ years in school ERP. " +
+  "Its flagship platform is CampusCare, a cloud-based school management ERP used by 1200+ schools. " +
+  "Core modules include student registration and lifecycle records, fee management and online collection, " +
+  "exam and assessment workflows, lesson planning and assignments, parent-teacher communication portals, " +
+  "library, HR, payroll, inventory, attendance, and bus GPS tracking. " +
+  "The platform supports NEP 2020 aligned structures and competency-focused assessment, " +
+  "and provides analytics dashboards for data-driven school decisions.";
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.target !== "offscreen") {
@@ -102,9 +110,8 @@ async function startPipeline(streamId) {
 function stopPipeline() {
   isCapturing = false;
   partialTranscript = "";
-  transcriptBuffer.length = 0;
-  clearTimeout(suggestionDebounceId);
-  suggestionDebounceId = null;
+  outputSuggestionTranscript = "";
+  finalizedSuggestions = [];
   clearTimeout(reconnectTimerId);
   reconnectTimerId = null;
   reconnectAttempt = 0;
@@ -222,7 +229,20 @@ async function connectWithModel(model, connectionToken) {
         parts: [
           {
             text:
-              "You are a transcription assistant. Prioritize accurate input transcription. Keep spoken responses extremely brief. You work for ENTAB Infotech"
+              "You are a live meeting copilot for ENTAB Infotech. " +
+              "After each user turn, generate exactly 3 high-quality response suggestions the user can say next. " +
+              "The suggestions must be direct answers/statements the user can speak immediately, not follow-up questions. " +
+              "Use assertive, professional, helpful language in business conversations. " +
+              "Each suggestion must be one line, natural spoken English, under 18 words, and non-repetitive. " +
+              "Never use question marks. Never ask the other person another question. " +
+              "Prefer grounded answers based on this product knowledge: " +
+              ENTAB_KNOWLEDGE_BASE +
+              " " +
+              "Output format must be exactly:\n" +
+              "1) <suggestion>\n" +
+              "2) <suggestion>\n" +
+              "3) <suggestion>\n" +
+              "Do not output anything except these 3 lines."
           }
         ]
       }
@@ -266,12 +286,14 @@ async function connectWithModel(model, connectionToken) {
           });
         }
 
+        const outputText = serverContent?.outputTranscription?.text;
+        if (outputText) {
+          outputSuggestionTranscript = mergeStreamingText(outputSuggestionTranscript, outputText);
+          emitCurrentSuggestions();
+        }
+
         if (serverContent.turnComplete) {
           if (partialTranscript.trim()) {
-            transcriptBuffer.push(partialTranscript.trim());
-            if (transcriptBuffer.length > 100) {
-              transcriptBuffer.shift();
-            }
             forwardMessage({
               type: "TRANSCRIPT_UPDATE",
               tabId: activeTabId,
@@ -280,11 +302,24 @@ async function connectWithModel(model, connectionToken) {
             });
           }
 
+          if (outputSuggestionTranscript.trim()) {
+            const finalizedLines = extractSuggestionLines(outputSuggestionTranscript);
+            if (finalizedLines.length > 0) {
+              for (const line of finalizedLines) {
+                const previous = finalizedSuggestions[finalizedSuggestions.length - 1] || "";
+                if (previous !== line) {
+                  finalizedSuggestions.push(line);
+                }
+              }
+              if (finalizedSuggestions.length > 12) {
+                finalizedSuggestions = finalizedSuggestions.slice(-12);
+              }
+            }
+          }
+
           partialTranscript = "";
-          clearTimeout(suggestionDebounceId);
-          suggestionDebounceId = setTimeout(() => {
-            triggerSuggestions().catch(() => {});
-          }, 500);
+          outputSuggestionTranscript = "";
+          emitCurrentSuggestions();
         }
       },
       onerror: (event) => {
@@ -398,70 +433,111 @@ function uint8ToBinary(uint8Array) {
   return binary;
 }
 
-async function triggerSuggestions() {
-  if (!apiKey || transcriptBuffer.length === 0) {
-    return;
+function emitCurrentSuggestions() {
+  const suggestions = finalizedSuggestions.slice(-6);
+  const liveLines = extractSuggestionLines(outputSuggestionTranscript);
+  if (liveLines.length > 0) {
+    suggestions.push(...liveLines);
   }
-
-  const recentTranscript = transcriptBuffer.slice(-20).join("\n");
-  const endpoint =
-    `https://generativelanguage.googleapis.com/v1beta/models/${SUGGESTION_MODEL}:generateContent` +
-    `?key=${encodeURIComponent(apiKey)}`;
-
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      generationConfig: {
-        responseMimeType: "application/json",
-        maxOutputTokens: 200,
-        temperature: 0.7
-      },
-      systemInstruction: {
-        parts: [
-          {
-            text: "You generate 2-3 concise meeting replies. Return strictly JSON array of strings.always in english. remember you work for entab infotech"
-          }
-        ]
-      },
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {
-              text:
-                "Transcript:\n" +
-                recentTranscript +
-                "\n\nGenerate reply suggestions under 15 words each."
-            }
-          ]
-        }
-      ]
-    })
-  });
-
-  if (!response.ok) {
-    return;
-  }
-
-  const data = await response.json();
-  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "[]";
-  let suggestions = [];
-  try {
-    suggestions = JSON.parse(text);
-  } catch (_) {
-    suggestions = [];
-  }
-
-  if (!Array.isArray(suggestions)) {
-    suggestions = [];
-  }
-
   forwardMessage({
     type: "SUGGESTION_UPDATE",
     tabId: activeTabId,
-    suggestions: suggestions.slice(0, 3).filter((item) => typeof item === "string" && item.trim())
+    suggestions: uniqueLastN(suggestions, 3)
   });
+}
+
+function mergeStreamingText(previous, incoming) {
+  const prev = (previous || "").trim();
+  const next = (incoming || "").trim();
+  if (!next) {
+    return prev;
+  }
+
+  // Some streaming chunks are full replacements, others are incremental.
+  if (!prev) {
+    return next;
+  }
+  if (next.startsWith(prev)) {
+    return next;
+  }
+  if (prev.startsWith(next)) {
+    return prev;
+  }
+
+  const combined = `${prev} ${next}`.replace(/\s+/g, " ").trim();
+  return combined;
+}
+
+function normalizeSuggestionLine(text) {
+  if (!text || !text.trim()) {
+    return "";
+  }
+
+  let cleaned = text.replace(/\r/g, " ").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+  cleaned = cleaned.replace(/^\s*[-*•\d.)]+\s*/, "").trim();
+  if (cleaned.length > 140) {
+    cleaned = cleaned.slice(0, 140).trim();
+  }
+  return cleaned;
+}
+
+function extractSuggestionLines(text) {
+  if (!text || !text.trim()) {
+    return [];
+  }
+
+  const lines = text
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .map((line) => normalizeSuggestionLine(line))
+    .filter(Boolean)
+    .map((line) => line.replace(/^\d+\)\s*/, "").trim());
+
+  if (lines.length >= 2) {
+    return uniqueLastN(lines, 3);
+  }
+
+  const byNumbering = text
+    .split(/\s(?=\d+\))/g)
+    .map((part) => normalizeSuggestionLine(part).replace(/^\d+\)\s*/, "").trim())
+    .filter(Boolean);
+  if (byNumbering.length >= 2) {
+    return uniqueLastN(byNumbering, 3);
+  }
+
+  const bySentence = text
+    .split(/[.!?]\s+/)
+    .map((part) => normalizeSuggestionLine(part))
+    .filter(Boolean);
+  return uniqueLastN(bySentence, 3);
+}
+
+function uniqueLastN(items, n) {
+  const seen = new Set();
+  const reversed = [];
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    const value = items[i];
+    if (!value || seen.has(value) || isQuestionStyle(value)) {
+      continue;
+    }
+    seen.add(value);
+    reversed.push(value);
+    if (reversed.length >= n) {
+      break;
+    }
+  }
+  return reversed.reverse();
+}
+
+function isQuestionStyle(text) {
+  const t = text.trim().toLowerCase();
+  if (!t) {
+    return false;
+  }
+  if (t.includes("?")) {
+    return true;
+  }
+  return /^(what|why|how|when|where|who|which|can|could|would|should|is|are|do|does|did)\b/.test(t);
 }
 
 function forwardMessage(message) {
