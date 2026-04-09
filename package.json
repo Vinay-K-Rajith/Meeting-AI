@@ -1,0 +1,27 @@
+{
+  "name": "meeting-assistant",
+  "version": "1.0.0",
+  "main": "background.js",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "echo \"No tests configured\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Vinay-K-Rajith/Meeting-AI.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Vinay-K-Rajith/Meeting-AI/issues"
+  },
+  "homepage": "https://github.com/Vinay-K-Rajith/Meeting-AI#readme",
+  "description": "",
+  "dependencies": {
+    "@google/genai": "^1.49.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.0"
+  }
+}
