@@ -27,7 +27,7 @@
   "web_accessible_resources": [
     {
       "resources": ["pcm-processor.js"],
-      "matches": ["https://meet.google.com/*"]
+      "matches": ["<all_urls>"]
     }
   ]
 }

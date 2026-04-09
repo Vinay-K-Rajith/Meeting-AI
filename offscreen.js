@@ -12,7 +12,9 @@ const transcriptBuffer = [];
 let suggestionDebounceId = null;
 
 const LIVE_MODEL = "gemini-3.1-flash-live-preview";
+const LIVE_MODEL_FALLBACK = "gemini-2.5-flash";
 const SUGGESTION_MODEL = "gemini-flash-lite-latest";
+let currentLiveModel = LIVE_MODEL;
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.target !== "offscreen") {
@@ -45,6 +47,8 @@ async function startPipeline(streamId) {
   if (!apiKey) {
     throw new Error("Gemini API key missing.");
   }
+
+  currentLiveModel = LIVE_MODEL;
 
   tabStream = await navigator.mediaDevices.getUserMedia({
     audio: {
@@ -145,7 +149,8 @@ function connectGeminiLive() {
     forwardMessage({
       type: "ASSISTANT_ERROR",
       tabId: activeTabId,
-      error: "Gemini Live setup timeout. Check model access and API key."
+      error:
+        "Gemini Live setup timeout. Check API key restrictions, quota, and model access."
     });
   }, 8000);
 
@@ -159,12 +164,12 @@ function connectGeminiLive() {
     liveSocket.send(
       JSON.stringify({
         setup: {
-          model: `models/${LIVE_MODEL}`,
-          generation_config: {
-            response_modalities: ["TEXT"]
+          model: `models/${currentLiveModel}`,
+          generationConfig: {
+            responseModalities: ["TEXT"]
           },
-          input_audio_transcription: {},
-          system_instruction: {
+          inputAudioTranscription: {},
+          systemInstruction: {
             parts: [
               {
                 text: "You are a silent transcription assistant. Only transcribe incoming speech."
@@ -198,6 +203,9 @@ function connectGeminiLive() {
     if (!serverContent) {
       return;
     }
+
+    // Some sessions may not emit setupComplete explicitly; any serverContent means the config was accepted.
+    clearTimeout(setupTimeoutId);
 
     const inputText = serverContent?.inputTranscription?.text;
     if (inputText) {
@@ -249,17 +257,34 @@ function connectGeminiLive() {
     }
 
     if (event.code !== 1000) {
+      const closeReason = event.reason ? ` Reason: ${event.reason}` : "";
+
+      // Retry once with fallback model when primary model may be unavailable.
+      if (currentLiveModel === LIVE_MODEL) {
+        currentLiveModel = LIVE_MODEL_FALLBACK;
+      }
+
       forwardMessage({
         type: "CAPTURE_STATE",
         tabId: activeTabId,
         state: "RECONNECTING"
+      });
+      forwardMessage({
+        type: "ASSISTANT_ERROR",
+        tabId: activeTabId,
+        error:
+          `Gemini Live disconnected (code ${event.code}).` +
+          `${closeReason} Retrying with model ${currentLiveModel}.`
       });
       setTimeout(() => {
         if (isCapturing) {
           connectGeminiLive();
         }
       }, 1500);
+      return;
     }
+
+    currentLiveModel = LIVE_MODEL;
   };
 }
 
